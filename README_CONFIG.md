@@ -739,12 +739,238 @@ Alternative OAuth2 token managers: [gmail-oauth2-tools](https://github.com/googl
 
 ---
 
-## Reference: Sample Files
+## External Tool Integration
 
-| File | Purpose |
-|------|---------|
-| `samples/config.lua` | Basic filtering examples with multiple accounts and mailboxes. |
-| `samples/extend.lua` | Advanced patterns: IDLE, daemon mode, external tools, OAuth2, recovery. |
+IMAPFilter provides built-in functions for communicating with external programs via standard I/O pipes, enabling integration with a wide range of Unix utilities and custom scripts. The primary mechanisms are `pipe_to()` and `pipe_from()`, which wrap the POSIX `popen()` call.
+
+### Pipe Functions
+
+| Function | Description |
+|----------|-------------|
+| `pipe_to(command, data)` | Executes `command` and sends `data` to its stdin. Returns the child process's exit status as a number. |
+| `pipe_from(command)` | Executes `command` and reads from its stdout. Returns `(exit_status, output_string)`. |
+
+These functions allow IMAPFilter to act as a pipeline orchestrator — fetching messages from an IMAP server, piping them through external tools (spam filters, encryption utilities, text processors), and acting on the results.
+
+### External Spam Filtering
+
+IMAPFilter can integrate with any command-line spam filter that reads message content from stdin and returns an exit code indicating whether the message is spam:
+
+```lua
+-- Filter all messages using a custom bayesian spam classifier
+all = account.INBOX:select_all()
+results = Set {}
+
+for _, mesg in ipairs(all) do
+    mbox, uid = table.unpack(mesg)
+    text = mbox[uid]:fetch_message()
+    if pipe_to('bayesian-spam-filter', text) == 1 then
+        table.insert(results, mesg)
+    end
+end
+
+results:delete_messages()
+```
+
+### Filtering Only Text Parts of Attachments
+
+When dealing with multipart messages (e.g., emails with HTML bodies and attachments), you can inspect only specific MIME parts:
+
+```lua
+all = account.INBOX:select_all()
+results = Set {}
+
+for _, mesg in ipairs(all) do
+    mbox, uid = table.unpack(mesg)
+    structure = mbox[uid]:fetch_structure()
+    for partid, partinfo in pairs(structure) do
+        if partinfo.type:lower() == 'text/plain' and (partinfo.size or 0) < 1024 then
+            part = mbox[uid]:fetch_part(partid)
+            if pipe_to('spam-checker', part) == 1 then
+                table.insert(results, mesg)
+                break
+            end
+        end
+    end
+end
+
+results:delete_messages()
+```
+
+### Password Vault Integration (e.g., `pass`)
+
+Retrieve credentials from a password manager like [pass](https://www.passwordstore.org/) (the Standard Unix Password Manager):
+
+```lua
+status, password = pipe_from('pass Email/imap-server')
+password = password:gsub('[\r\n]', '')  -- strip trailing newlines
+
+account = IMAP {
+    server   = 'imap.example.com',
+    username = 'user@example.com',
+    password = password
+}
+```
+
+### OAuth2 Token Management
+
+Generate and refresh OAuth2 tokens for servers supporting XOAUTH2 (e.g., Gmail) using external tools:
+
+```lua
+-- Using Google's oauth2.py tool
+status, output = pipe_from('oauth2.py --client_id=' .. clientid ..
+                   ' --client_secret=' .. clientsecret ..
+                   ' --refresh_token=' .. refreshtoken)
+_, _, accesstoken = string.find(output, 'Access Token: ([%w%p]+)\n')
+
+status, output = pipe_from('oauth2.py --generate_oauth2_string' ..
+                           ' --access_token=' .. accesstoken ..
+                           ' --user=' .. user)
+_, _, oauth2string = string.find(output, 'OAuth2 argument:\n([%w%p]+)\n')
+
+account = IMAP {
+    server = 'imap.gmail.com',
+    ssl    = 'tls1.2',
+    username = user,
+    oauth2   = oauth2string
+}
+```
+
+Alternative OAuth2 token managers that work with IMAPFilter:
+- [gmail-oauth2-tools](https://github.com/google/gmail-oauth2-tools) (Google's official Python tools)
+- [oama](https://github.com/pdobsan/oama)
+- [pizauth](https://github.com/ltratt/pizauth)
+- [email-oauth2-proxy](https://github.com/simonrob/email-oauth2-proxy)
+
+### Custom Message Processing Pipeline
+
+Process messages through a chain of external tools:
+
+```lua
+-- Fetch, process with external tool, and re-append with modified headers
+all = account.INBOX:select_all()
+for _, mesg in ipairs(all) do
+    mbox, uid = table.unpack(mesg)
+    header = mbox[uid]:fetch_header()
+    body   = mbox[uid]:fetch_body()
+
+    -- Pipe body through a custom processor (e.g., translation, summarization)
+    status, processed_body = pipe_from('my-processor ' .. uid)
+    if status == 0 then
+        message = header .. '\r\nX-Processed: true\r\n\r\n' .. processed_body
+        account.Archive:append_message(message)
+    end
+end
+```
+
+---
+
+### PCRE Regex Matching
+
+IMAPFilter includes built-in PCRE (Perl Compatible Regular Expressions) support via `regex_search()`:
+
+```lua
+-- Match a pattern and capture groups
+success, capture1, capture2 = regex_search('^(?i)pcre: (\\w+)
+
+### Date Utilities
+
+Generate dates relative to today for use with IMAP search methods:
+
+```lua
+-- Generate a date N days ago in 'day-month-year' format
+date = form_date(14)  -- e.g., "15-Mar-2024" (if today is 29-Mar-2024)
+
+-- Use with arrived_since / sent_since searches
+results = account.INBOX:arrived_since(form_date(7))
+```
+
+### Interactive Password Prompt
+
+Prompt the user for a password at runtime (useful in interactive mode):
+
+```lua
+password = get_password('Enter IMAP password: ')
+account = IMAP {
+    server   = 'imap.example.com',
+    username = 'user@example.com',
+    password = password
+}
+```
+
+### Background Daemon Mode
+
+Run IMAPFilter as a background daemon, periodically executing a filtering function:
+
+```lua
+function filter_loop()
+    results = account.INBOX:is_unseen()
+    if #results > 0 then
+        results:move_messages(account.archive)
+    end
+end
+
+-- Run every 600 seconds (10 minutes) in the background
+become_daemon(600, filter_loop)
+
+-- Prevent changing working directory and/or redirecting stdio
+become_daemon(600, filter_loop, true)              -- don't change directory
+become_daemon(600, filter_loop, true, true)         -- also don't redirect stdio
+```
+
+### Error Recovery with Exponential Backoff
+
+Wrap filtering logic in `recover()` to handle transient failures (network issues, server timeouts) gracefully:
+
+```lua
+function fragile_commands()
+    results = account.INBOX:is_old()
+    results:move_messages(account.archive)
+end
+
+-- Retry indefinitely on failure (with exponential backoff between retries)
+recover(fragile_commands)
+
+-- Retry up to N times
+recover(fragile_commands, 5)
+
+-- Handle errors explicitly
+success, errormsg = recover(fragile_commands, 5)
+if not success then
+    print('Failed:', errormsg)
+end
+
+-- Capture return values on success
+success2, results2 = recover(function()
+    return account.INBOX:is_seen()
+end)
+if success2 then
+    results2:delete_messages()
+end
+```
+
+### Supported External Tool Categories
+
+| Category | Example Tools | Use Case |
+|----------|--------------|----------|
+| **Spam filters** | SpamAssassin, `bayesian-spam-filter`, `spamc` | Classify messages as spam/ham based on exit code |
+| **Encryption** | GPG (`gpg --decrypt`, `gpg --encrypt`) | Decrypt incoming or encrypt outgoing messages |
+| **Password managers** | `pass`, `keepassxc-cli` | Retrieve credentials securely |
+| **OAuth2 tools** | `oauth2.py`, custom token refreshers | Generate and manage OAuth2 tokens |
+| **Text processors** | `sed`, `awk`, `grep`, `jq` | Transform message content or headers |
+| **Translation** | Custom ML models, CLI translators | Translate messages to different languages |
+| **Notification** | `notify-send`, custom scripts | Send alerts when specific messages arrive |
+
+### Limitations
+
+- **No bidirectional streaming**: `pipe_to()` and `pipe_from()` use a single-direction pipe (stdin or stdout). For two-way communication, you would need to invoke the tool twice or use a temporary file.
+- **Line-based output from `pipe_from()`**: The function reads until EOF of the subprocess's stdout. Large outputs are fully buffered in memory before being returned.
+- **No stderr capture**: Standard error of child processes is not captured; it goes to the parent's stderr (visible when running with `-v` or `-d`).
+- **Shell interpretation**: Commands are passed directly to `/bin/sh -c`, so shell metacharacters (`|`, `&`, `;`, etc.) work as expected.
+
+---
+
+## Reference: Sample Files
 
 ---
 
